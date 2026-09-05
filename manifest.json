@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hpolthof.macros",
+  "name": "Macros",
+  "version": "1.0.0",
+  "author": "Paul Olthof",
+  "license": "MIT",
+  "description": "Record what you type anywhere on the system and play it back. Save a take under a name of your own, give it a shortcut, and it becomes a Hyprland binding you can press from any window.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Macros",
+    "description": "Records keystrokes system-wide and replays them; each saved macro can carry a name and a shortcut.",
+    "category": "System",
+    "aliases": [
+      "macro",
+      "macros",
+      "keyboard"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

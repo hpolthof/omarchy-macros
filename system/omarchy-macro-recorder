@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Privileged half of the Omarchy macros plugin: a keyboard recorder.
+
+Reading key events means reading /dev/input, which is root:input, so this is
+the one piece that needs privilege. Everything else in the plugin runs as the
+user.
+
+It deliberately takes no arguments. The sudoers rule that lets the user start
+it without a password names this path and nothing else, so if a caller could
+influence where it reads or writes, that rule would hand out more than the
+right to record keystrokes. Instead: events go to stdout, and every path it
+touches is derived from the uid sudo reports.
+
+Output is one JSON object per line:
+
+    {"t": <ms since the first event>, "c": <evdev keycode>, "v": 0|1}
+
+Recording stops when the stop file appears, on SIGTERM/SIGINT, or when the
+safety cap runs out -- a recorder nobody remembered to stop is a keylogger, so
+it is not allowed to run indefinitely.
+"""
+
+import errno
+import json
+import os
+import selectors
+import signal
+import sys
+import time
+
+try:
+    import evdev
+    from evdev import ecodes
+except ImportError:
+    sys.stderr.write("python-evdev is not installed\n")
+    sys.exit(3)
+
+# A recording is a plain-text record of everything typed, so it stops on its
+# own rather than trusting the UI to always come back and stop it.
+MAX_DURATION = 600.0
+
+# ydotool replays through a uinput device. Without this the recorder would
+# happily record a playback that is running underneath it.
+IGNORED_NAMES = ("ydotool", "ydotoold")
+
+
+def caller_uid():
+    for var in ("SUDO_UID", "PKEXEC_UID"):
+        raw = os.environ.get(var)
+        if raw and raw.isdigit():
+            return int(raw)
+    return None
+
+
+def stop_path():
+    uid = caller_uid()
+    if uid is None:
+        return None
+    return "/run/user/%d/omarchy-macros/stop" % uid
+
+
+def is_keyboard(dev):
+    """A keyboard is a device that can report the letters, not just some keys.
+
+    Power buttons, lids and mice all carry EV_KEY, so the capability alone is
+    not enough to tell them apart from something you can type on.
+    """
+    if any(tag in dev.name.lower() for tag in IGNORED_NAMES):
+        return False
+    caps = dev.capabilities()
+    keys = caps.get(ecodes.EV_KEY)
+    if not keys:
+        return False
+    keys = set(keys)
+    letters = {ecodes.KEY_A, ecodes.KEY_S, ecodes.KEY_D, ecodes.KEY_F}
+    return letters.issubset(keys) and ecodes.KEY_ENTER in keys
+
+
+def open_keyboards():
+    found = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if is_keyboard(dev):
+            found.append(dev)
+        else:
+            dev.close()
+    return found
+
+
+def main():
+    stopping = {"now": False}
+
+    def request_stop(_signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    devices = open_keyboards()
+    if not devices:
+        sys.stderr.write("no keyboard found to record from\n")
+        return 4
+
+    sentinel = stop_path()
+    selector = selectors.DefaultSelector()
+    for dev in devices:
+        selector.register(dev, selectors.EVENT_READ)
+
+    # Timestamps are relative to the first key, so a slow start between the
+    # click and the typing does not become a pause on every playback.
+    origin = None
+    started = time.monotonic()
+
+    while not stopping["now"]:
+        if time.monotonic() - started > MAX_DURATION:
+            sys.stderr.write("recording stopped at the %d minute safety cap\n"
+                             % int(MAX_DURATION / 60))
+            break
+        if sentinel and os.path.exists(sentinel):
+            break
+
+        try:
+            ready = selector.select(timeout=0.1)
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            raise
+
+        for key, _mask in ready:
+            dev = key.fileobj
+            try:
+                events = list(dev.read())
+            except OSError:
+                # Unplugged mid-recording. Drop it and keep the others.
+                selector.unregister(dev)
+                continue
+            for event in events:
+                if event.type != ecodes.EV_KEY:
+                    continue
+                # 2 is autorepeat. The held key is already in the stream as a
+                # press, and playback re-derives repeats from its own timing.
+                if event.value not in (0, 1):
+                    continue
+                now = time.monotonic()
+                if origin is None:
+                    origin = now
+                sys.stdout.write(json.dumps({
+                    "t": int((now - origin) * 1000),
+                    "c": event.code,
+                    "v": event.value,
+                }) + "\n")
+                sys.stdout.flush()
+
+    for dev in devices:
+        try:
+            dev.close()
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

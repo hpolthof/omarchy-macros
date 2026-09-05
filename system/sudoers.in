@@ -1,0 +1,7 @@
+# Installed by bin/macros-setup, with @USER@ filled in.
+#
+# The binary named here takes no arguments and writes only to stdout, so this
+# rule grants the right to record keystrokes and nothing else. Do not widen it
+# to the directory: a rule that ends in a path the caller can influence is a
+# root shell.
+@USER@ ALL=(root) NOPASSWD: /usr/local/lib/omarchy-macros/omarchy-macro-recorder

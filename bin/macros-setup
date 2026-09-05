@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# Installs the two pieces of this plugin that cannot run as you.
+#
+# Recording keystrokes means reading /dev/input, and replaying them means
+# writing /dev/uinput. Neither is readable by a normal user, so this puts a
+# root-owned recorder in place with a narrow sudoers rule, and runs ydotoold
+# as a system service that hands you one socket.
+#
+# Run it once after installing the plugin:
+#
+#     ~/.config/omarchy/plugins/io.github.hpolthof.macros/bin/macros-setup
+#
+# It asks for your password, prints what it is about to do, and is safe to run
+# again -- a plugin update that changes the recorder is picked up by rerunning
+# it. `--uninstall` takes all of it back out.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+SOURCE_DIR="$PLUGIN_DIR/system"
+
+LIB_DIR=/usr/local/lib/omarchy-macros
+RECORDER="$LIB_DIR/omarchy-macro-recorder"
+SUDOERS=/etc/sudoers.d/omarchy-macros
+UNIT_NAME=omarchy-macros-ydotoold.service
+UNIT=/etc/systemd/system/$UNIT_NAME
+PACKAGES=(python-evdev ydotool)
+
+say() { printf '  %s\n' "$*"; }
+step() { printf '\n%s\n' "$*"; }
+fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+MODE=install
+case "${1:-}" in
+  "")           MODE=install ;;
+  --uninstall)  MODE=uninstall ;;
+  -h|--help)    sed -n '3,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  *)            fail "unknown argument: $1 (only --uninstall is understood)" ;;
+esac
+
+# Root from here on, but every path is still derived from the user who asked,
+# never from an argument.
+if [[ ${EUID} -ne 0 ]]; then
+  command -v sudo >/dev/null || fail "sudo is not installed"
+  exec sudo -- "$(readlink -f "$0")" "$@"
+fi
+
+TARGET_USER="${SUDO_USER:-}"
+[[ -n "$TARGET_USER" && "$TARGET_USER" != root ]] ||
+  fail "run this as your own user, not as root -- it needs to know whose keyboard to grant"
+TARGET_UID="$(id -u "$TARGET_USER")"
+TARGET_GID="$(id -g "$TARGET_USER")"
+
+uninstall() {
+  step "Removing the system pieces of the macros plugin"
+  if systemctl list-unit-files "$UNIT_NAME" >/dev/null 2>&1; then
+    systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+    say "stopped $UNIT_NAME"
+  fi
+  rm -f "$UNIT" "$SUDOERS"
+  rm -rf "$LIB_DIR"
+  systemctl daemon-reload
+  say "removed $UNIT"
+  say "removed $SUDOERS"
+  say "removed $LIB_DIR"
+  printf '\nThe packages (%s) were left installed.\n' "${PACKAGES[*]}"
+  printf 'Your recorded macros and shortcuts are untouched; to clear those too:\n'
+  printf '  %s/bin/macros uninstall --all\n' "$PLUGIN_DIR"
+}
+
+install_packages() {
+  local missing=()
+  local package
+  for package in "${PACKAGES[@]}"; do
+    pacman -Qq "$package" >/dev/null 2>&1 || missing+=("$package")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    say "already installed: ${PACKAGES[*]}"
+    return
+  fi
+  say "installing: ${missing[*]}"
+  pacman -S --needed --noconfirm "${missing[@]}"
+}
+
+install_recorder() {
+  [[ -f "$SOURCE_DIR/omarchy-macro-recorder" ]] ||
+    fail "$SOURCE_DIR/omarchy-macro-recorder is missing"
+  install -d -m 0755 -o root -g root "$LIB_DIR"
+  install -m 0755 -o root -g root \
+    "$SOURCE_DIR/omarchy-macro-recorder" "$RECORDER"
+  say "$RECORDER"
+}
+
+install_sudoers() {
+  local staged
+  staged="$(mktemp)"
+  sed "s|@USER@|$TARGET_USER|g" "$SOURCE_DIR/sudoers.in" > "$staged"
+  # A malformed file here locks the machine out of sudo entirely, so it is
+  # never written unless visudo has already accepted it.
+  visudo -c -q -f "$staged" || { rm -f "$staged"; fail "generated sudoers rule is invalid"; }
+  install -m 0440 -o root -g root "$staged" "$SUDOERS"
+  rm -f "$staged"
+  say "$SUDOERS (for $TARGET_USER)"
+}
+
+install_service() {
+  sed -e "s|@UID@|$TARGET_UID|g" -e "s|@GID@|$TARGET_GID|g" \
+    "$SOURCE_DIR/$UNIT_NAME.in" > "$UNIT"
+  chmod 0644 "$UNIT"
+  systemctl daemon-reload
+  systemctl enable --now "$UNIT_NAME"
+  say "$UNIT (socket owned by $TARGET_USER, mode 0600)"
+}
+
+if [[ "$MODE" == uninstall ]]; then
+  uninstall
+  exit 0
+fi
+
+printf 'Setting up the macros plugin for %s.\n' "$TARGET_USER"
+
+step "Packages"
+install_packages
+
+step "Recorder (root-owned, no arguments, one sudoers rule)"
+install_recorder
+install_sudoers
+
+step "ydotoold (system service, one socket for $TARGET_USER)"
+install_service
+
+step "Done."
+say "check it with: $PLUGIN_DIR/bin/macros doctor"

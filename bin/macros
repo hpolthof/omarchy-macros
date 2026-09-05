@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""Everything the macros plugin does that is not drawing.
+
+The QML in the bar owns no logic of its own: it calls in here and renders what
+comes back, so the plugin is equally usable from a terminal and from a
+Hyprland binding. Output is JSON on stdout for the commands the panel reads,
+and human-readable text for the ones a person runs.
+
+The split with the privileged recorder is deliberate. That one binary reads
+/dev/input as root and writes the key stream to stdout; this file, running as
+the user, owns the stream, the files, the shortcuts and the playback. Nothing
+here needs a password.
+
+Putting that recorder in place does, and that is the one thing this file does
+not do: see bin/macros-setup, next to this one.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+RECORDER = "/usr/local/lib/omarchy-macros/omarchy-macro-recorder"
+YDOTOOL_SOCKET = "/run/omarchy-macros/ydotoold.socket"
+
+SELF = os.path.realpath(__file__)
+# The installer for the two pieces that cannot run as the user. Named here so
+# that everything which reports a broken stack points at the same command.
+SETUP = os.path.join(os.path.dirname(SELF), "macros-setup")
+
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+    "omarchy-macros")
+MACRO_DIR = os.path.join(DATA_DIR, "macros")
+CONFIG = os.path.join(DATA_DIR, "config.json")
+
+# Recording is the one thing you cannot start from the panel while your hands
+# are already where the macro belongs, so a key is proposed -- free on a stock
+# Omarchy, and R for record. It is only proposed: a plugin does not get to
+# claim a key on the user's keyboard by being installed, so nothing is bound
+# until the switch in the panel is turned on.
+DEFAULT_RECORD_SHORTCUT = "SUPER + SHIFT + R"
+RUN_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or ("/run/user/%d" % os.getuid()),
+    "omarchy-macros")
+
+CURRENT = os.path.join(RUN_DIR, "current.jsonl")
+CURRENT_ERR = os.path.join(RUN_DIR, "current.err")
+PENDING = os.path.join(RUN_DIR, "pending.jsonl")
+PIDFILE = os.path.join(RUN_DIR, "recorder.pid")
+STARTED = os.path.join(RUN_DIR, "started")
+STOPFILE = os.path.join(RUN_DIR, "stop")
+
+HYPR_DIR = os.path.expanduser("~/.config/hypr")
+BIND_FILE = os.path.join(HYPR_DIR, "macros.lua")
+BINDINGS = os.path.join(HYPR_DIR, "bindings.lua")
+# pcall, not a bare require: macros.lua is generated, and a config that
+# refuses to load because the user deleted a generated file is a worse
+# outcome than a missing shortcut.
+BIND_REQUIRE = 'pcall(require, "hypr.macros")'
+LEGACY_REQUIRE = 'require("hypr.macros")'
+
+# Every modifier, released before a playback starts. If the macro was fired
+# from a keybinding the user is still physically holding those keys down, and
+# a macro typed while the compositor thinks SUPER is down is not the macro
+# that was recorded.
+MODIFIERS = [29, 97, 42, 54, 56, 100, 125, 126]
+
+# Two events closer together than this were, for replay purposes, at the same
+# moment. Grouping them keeps a long macro from paying process startup per key.
+SIMULTANEOUS_MS = 5
+# A recording contains the pauses where the user was thinking. Replaying those
+# in full turns a five second macro into a thirty second one.
+MAX_GAP_MS = 2000
+# Time to let go of the keybinding that started the playback.
+LEAD_IN_MS = 300
+
+
+# ------------------------------------------------------------------- config
+
+def load_config():
+    config = {"recordShortcut": DEFAULT_RECORD_SHORTCUT,
+              "recordShortcutEnabled": False}
+    try:
+        with open(CONFIG) as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            config.update(stored)
+    except (OSError, ValueError):
+        pass
+    return config
+
+
+def save_config(config):
+    ensure_dirs()
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(config, handle, indent=1)
+    os.replace(tmp, CONFIG)
+
+
+def cmd_config():
+    emit(load_config())
+
+
+def cmd_record_shortcut(argv):
+    """Choose the combination. Choosing one does not switch it on."""
+    config = load_config()
+    config["recordShortcut"] = normalize_shortcut(argv[0]) if argv else ""
+    if not config["recordShortcut"]:
+        config["recordShortcutEnabled"] = False
+    save_config(config)
+    sync_binds()
+    emit(config)
+
+
+def cmd_record_shortcut_enabled(argv):
+    config = load_config()
+    wanted = bool(argv) and argv[0] == "true"
+    if wanted and not config.get("recordShortcut"):
+        die("choose a combination first")
+    config["recordShortcutEnabled"] = wanted
+    save_config(config)
+    sync_binds()
+    emit(config)
+
+
+# --------------------------------------------------------------------- util
+
+def die(message, code=1):
+    sys.stderr.write(message.rstrip() + "\n")
+    sys.exit(code)
+
+
+def emit(payload):
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+
+
+def ensure_dirs():
+    os.makedirs(MACRO_DIR, exist_ok=True)
+    os.makedirs(RUN_DIR, exist_ok=True)
+
+
+def read_jsonl(path):
+    events = []
+    try:
+        with open(path) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return events
+
+
+def unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- recording
+
+def recorder_pid():
+    """The live recorder's pid, or None.
+
+    `kill -0` is no help here: the recorder runs as root, so the check comes
+    back as "not permitted" for a process that is very much alive. /proc tells
+    the truth, and the cmdline check covers pid reuse.
+    """
+    try:
+        with open(PIDFILE) as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            cmdline = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    return pid if RECORDER in cmdline else None
+
+
+def cmd_record():
+    ensure_dirs()
+    if recorder_pid():
+        die("already recording")
+    unlink(STOPFILE)
+    unlink(PENDING)
+    out = open(CURRENT, "w")
+    err = open(CURRENT_ERR, "w")
+    proc = subprocess.Popen(
+        ["sudo", "-n", RECORDER],
+        stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+        start_new_session=True)
+    out.close()
+    err.close()
+    with open(PIDFILE, "w") as handle:
+        handle.write(str(proc.pid))
+    with open(STARTED, "w") as handle:
+        handle.write(str(int(time.time())))
+
+    # sudo -n fails instantly when the rule is missing, and a recorder that
+    # died in the first fraction of a second should be reported as an error
+    # rather than as a recording in progress.
+    time.sleep(0.35)
+    if not recorder_pid():
+        reason = ""
+        try:
+            with open(CURRENT_ERR) as handle:
+                reason = handle.read().strip()
+        except OSError:
+            pass
+        unlink(PIDFILE)
+        die(reason or "the recorder did not start")
+    emit({"recording": True})
+
+
+def cmd_stop():
+    ensure_dirs()
+    if not recorder_pid():
+        # Not recording is the state the caller wanted, so this is not an
+        # error; it just has nothing to hand back.
+        unlink(PIDFILE)
+        emit({"recording": False, "events": 0})
+        return
+    open(STOPFILE, "w").close()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and recorder_pid():
+        time.sleep(0.05)
+    unlink(STOPFILE)
+    unlink(PIDFILE)
+    unlink(STARTED)
+    try:
+        os.replace(CURRENT, PENDING)
+    except OSError:
+        pass
+    emit({"recording": False, "events": len(read_jsonl(PENDING))})
+
+
+def cmd_cancel():
+    if recorder_pid():
+        open(STOPFILE, "w").close()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and recorder_pid():
+            time.sleep(0.05)
+        unlink(STOPFILE)
+    unlink(PIDFILE)
+    unlink(STARTED)
+    unlink(CURRENT)
+    unlink(PENDING)
+    emit({"recording": False, "events": 0})
+
+
+def cmd_discard():
+    unlink(PENDING)
+    emit({"pending": False})
+
+
+def cmd_state():
+    config = load_config()
+    recording = recorder_pid() is not None
+    seconds = 0
+    if recording:
+        try:
+            with open(STARTED) as handle:
+                seconds = max(0, int(time.time()) - int(handle.read().strip()))
+        except (OSError, ValueError):
+            seconds = 0
+    live = len(read_jsonl(CURRENT)) if recording else 0
+    pending = read_jsonl(PENDING) if os.path.exists(PENDING) else []
+    error = ""
+    if not recording and os.path.exists(CURRENT_ERR):
+        try:
+            with open(CURRENT_ERR) as handle:
+                error = handle.read().strip()
+        except OSError:
+            error = ""
+    emit({
+        "recording": recording,
+        "seconds": seconds,
+        "events": live,
+        "keys": live // 2,
+        "pending": len(pending) > 0,
+        "pendingEvents": len(pending),
+        "pendingKeys": len(pending) // 2,
+        "error": error,
+        # Carried on the state the panel already polls, so showing the key
+        # that starts and stops a recording costs no extra call.
+        "recordShortcut": config.get("recordShortcut", ""),
+        "recordShortcutEnabled": config.get("recordShortcutEnabled") is True,
+    })
+
+
+# -------------------------------------------------------------- normalizing
+
+def normalize(events, stop_shortcut=""):
+    """Make a raw capture safe to replay.
+
+    A recording picks up the tail of whatever started it and stops before
+    whatever was still held down comes back up, so the raw stream is not
+    balanced. Replaying it unbalanced leaves the compositor believing a key is
+    still pressed, which is the difference between a macro and a stuck
+    keyboard.
+    """
+    pressed = {}
+    clean = []
+    for event in events:
+        code = event.get("c")
+        value = event.get("v")
+        when = event.get("t", 0)
+        if not isinstance(code, int) or value not in (0, 1):
+            continue
+        if value == 1:
+            if code in pressed:
+                continue
+            clean.append({"t": when, "c": code, "v": value})
+            pressed[code] = len(clean) - 1
+            continue
+        # A release with no press in front of it belongs to the keystroke
+        # that started the recording, not to the macro.
+        if code not in pressed:
+            continue
+        del pressed[code]
+        clean.append({"t": when, "c": code, "v": value})
+
+    held = set(pressed.values())
+
+    # Stopping with the keybinding puts that chord at the end of the capture:
+    # the recorder is still reading when the first key of it goes down. Walk
+    # back over any trailing keys that belong to the stop shortcut and drop
+    # the run -- but only once it holds both the shortcut's own key and one of
+    # its modifiers, so a macro that merely ends in "r" keeps its r.
+    mods, main = shortcut_codes(stop_shortcut)
+    if main:
+        chord = mods | main
+        cut = len(clean)
+        while cut > 0 and clean[cut - 1]["c"] in chord:
+            cut -= 1
+        tail = {clean[i]["c"] for i in range(cut, len(clean))}
+        if tail & main and tail & mods:
+            del clean[cut:]
+            held = {index for index in held if index < cut}
+
+    # Whatever is still held when the recording stops is the thing that
+    # stopped it -- a hand on a keybinding, or on the way to the mouse. Those
+    # presses are dropped rather than paired with invented releases, because
+    # a macro that ends by pressing the key that ends recordings would fire
+    # this plugin every time it ran.
+    for index in sorted(held, reverse=True):
+        del clean[index]
+
+    if not clean:
+        return []
+
+    origin = clean[0]["t"]
+    for event in clean:
+        event["t"] -= origin
+    return clean
+
+
+# ------------------------------------------------------------------ storage
+
+# Hyprland names keys one way and evdev numbers them another. The names come
+# from evdev itself rather than a table typed out here, so the two cannot
+# drift apart.
+HYPR_TO_EVDEV = {
+    "Escape": "ESC", "Return": "ENTER", "BackSpace": "BACKSPACE",
+    "Prior": "PAGEUP", "Next": "PAGEDOWN", "period": "DOT",
+    "bracketleft": "LEFTBRACE", "bracketright": "RIGHTBRACE",
+}
+
+MODIFIER_CODES = {
+    "SUPER": ("LEFTMETA", "RIGHTMETA"),
+    "CTRL": ("LEFTCTRL", "RIGHTCTRL"),
+    "ALT": ("LEFTALT", "RIGHTALT"),
+    "SHIFT": ("LEFTSHIFT", "RIGHTSHIFT"),
+}
+
+
+def evdev_code(name):
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return None
+    return getattr(ecodes, "KEY_" + name.upper(), None)
+
+
+def shortcut_codes(shortcut):
+    """Split a shortcut into the evdev codes for its modifiers and its key."""
+    parts = [p for p in (shortcut or "").split(" + ") if p]
+    if not parts:
+        return set(), set()
+    mods = set()
+    for name in parts[:-1]:
+        for evdev_name in MODIFIER_CODES.get(name.upper(), ()):
+            code = evdev_code(evdev_name)
+            if code is not None:
+                mods.add(code)
+    key = parts[-1]
+    code = evdev_code(HYPR_TO_EVDEV.get(key, key))
+    return mods, ({code} if code is not None else set())
+
+
+def macro_path(macro_id):
+    if not re.fullmatch(r"m[0-9a-f]+", macro_id or ""):
+        die("invalid macro id")
+    return os.path.join(MACRO_DIR, macro_id + ".json")
+
+
+def load_macro(macro_id):
+    path = macro_path(macro_id)
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        die("no macro %s" % macro_id)
+
+
+def write_macro(macro):
+    path = macro_path(macro["id"])
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(macro, handle, indent=1)
+    os.replace(tmp, path)
+
+
+def all_macros():
+    ensure_dirs()
+    macros = []
+    for name in os.listdir(MACRO_DIR):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(MACRO_DIR, name)) as handle:
+                macros.append(json.load(handle))
+        except (OSError, ValueError):
+            continue
+    macros.sort(key=lambda m: m.get("created", 0), reverse=True)
+    return macros
+
+
+def summarize(macro):
+    events = macro.get("events") or []
+    return {
+        "id": macro.get("id", ""),
+        "name": macro.get("name", ""),
+        "created": macro.get("created", 0),
+        "shortcut": macro.get("shortcut", ""),
+        "speed": macro.get("speed", "fast"),
+        "events": len(events),
+        "keys": len(events) // 2,
+        "durationMs": events[-1]["t"] if events else 0,
+    }
+
+
+def cmd_save(argv):
+    if not argv:
+        die("usage: macros save <name> [shortcut] [fast|real]")
+    name = argv[0].strip()
+    shortcut = argv[1].strip() if len(argv) > 1 else ""
+    speed = argv[2].strip() if len(argv) > 2 else "fast"
+    if not name:
+        die("a macro needs a name")
+    if speed not in ("fast", "real"):
+        die("speed is fast or real")
+
+    events = normalize(read_jsonl(PENDING), load_config().get("recordShortcut", ""))
+    if not events:
+        die("there is nothing recorded to save")
+
+    macro = {
+        "id": "m%x" % int(time.time() * 1000),
+        "name": name,
+        "created": int(time.time()),
+        "shortcut": shortcut,
+        "speed": speed,
+        "events": events,
+    }
+    write_macro(macro)
+    unlink(PENDING)
+    sync_binds()
+    emit(summarize(macro))
+
+
+def cmd_list():
+    emit([summarize(macro) for macro in all_macros()])
+
+
+def cmd_delete(argv):
+    if not argv:
+        die("usage: macros delete <id>")
+    unlink(macro_path(argv[0]))
+    sync_binds()
+    emit({"deleted": argv[0]})
+
+
+def cmd_rename(argv):
+    if len(argv) < 2:
+        die("usage: macros rename <id> <name>")
+    macro = load_macro(argv[0])
+    name = argv[1].strip()
+    if not name:
+        die("a macro needs a name")
+    macro["name"] = name
+    write_macro(macro)
+    sync_binds()
+    emit(summarize(macro))
+
+
+def cmd_shortcut(argv):
+    if not argv:
+        die("usage: macros shortcut <id> [keys]")
+    macro = load_macro(argv[0])
+    macro["shortcut"] = normalize_shortcut(argv[1]) if len(argv) > 1 else ""
+    write_macro(macro)
+    sync_binds()
+    emit(summarize(macro))
+
+
+def cmd_speed(argv):
+    if len(argv) < 2 or argv[1] not in ("fast", "real"):
+        die("usage: macros speed <id> fast|real")
+    macro = load_macro(argv[0])
+    macro["speed"] = argv[1]
+    write_macro(macro)
+    emit(summarize(macro))
+
+
+# ---------------------------------------------------------------- shortcuts
+
+def normalize_shortcut(raw):
+    """Accept what a person types and hand Hyprland what it expects."""
+    parts = [p.strip().upper() for p in re.split(r"[+\s]+", raw or "") if p.strip()]
+    return " + ".join(parts)
+
+
+def cmd_check_shortcut(argv):
+    """Report what a shortcut would collide with, without changing anything.
+
+    Silently stealing a key the user already relies on is worse than telling
+    them and letting them pick, so this only ever reports.
+    """
+    if not argv:
+        die("usage: macros check-shortcut <keys> [macroId]")
+    wanted = normalize_shortcut(argv[0])
+    # A macro that already holds this shortcut is not competing with itself.
+    mine = ""
+    if len(argv) > 1 and argv[1] == "record":
+        mine = RECORD_BIND_LABEL
+    elif len(argv) > 1 and argv[1]:
+        mine = "Macro: " + (load_macro(argv[1]).get("name") or "")
+    if not wanted:
+        emit({"shortcut": "", "conflict": ""})
+        return
+
+    keys = wanted.split(" + ")
+    key = keys[-1]
+    mods = set(keys[:-1])
+
+    conflict = ""
+    try:
+        raw = subprocess.run(["hyprctl", "-j", "binds"],
+                             capture_output=True, text=True, timeout=5)
+        binds = json.loads(raw.stdout) if raw.returncode == 0 else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        binds = []
+
+    for bind in binds:
+        if str(bind.get("key", "")).upper() != key:
+            continue
+        if decode_modmask(bind.get("modmask", 0)) != mods:
+            continue
+        # Omarchy binds carry a description; a raw dispatcher is the
+        # fallback for the ones written straight in Hyprland syntax.
+        label = (bind.get("description") or "").strip()
+        if not label:
+            label = (str(bind.get("dispatcher", "")) + " "
+                     + str(bind.get("arg", ""))).strip()
+        if mine and label == mine:
+            continue
+        conflict = label
+        break
+
+    emit({"shortcut": wanted, "conflict": conflict})
+
+
+def decode_modmask(mask):
+    names = {1: "SHIFT", 4: "CTRL", 8: "ALT", 64: "SUPER"}
+    return {name for bit, name in names.items() if mask & bit}
+
+
+RECORD_BIND_LABEL = "Record a macro"
+
+
+def sync_binds():
+    """Own one Hyprland file completely rather than editing the user's.
+
+    bindings.lua gets a single require line added once; every macro binding
+    lives in macros.lua, which is rewritten wholesale. That way removing a
+    macro cannot leave a stale bind behind, and nothing the user wrote by hand
+    is ever rewritten.
+    """
+    macros = [m for m in all_macros() if m.get("shortcut")]
+
+    # There is no uninstall hook: removing a plugin deletes its directory and
+    # nothing else. So the bindings check for the plugin before registering
+    # themselves, and removing it takes its keys with it -- what is left
+    # behind is this file, binding nothing.
+    lines = [
+        "-- Generated by the Omarchy macros plugin",
+        "-- (io.github.hpolthof.macros). Rewritten whenever a macro changes;",
+        "-- edits here are lost. Change shortcuts from the panel in the bar.",
+        "--",
+        "-- Nothing below is bound once the plugin is uninstalled.",
+        "",
+        'local macros = "%s"' % SELF,
+        "local installed = io.open(macros, \"r\")",
+        "",
+        "if installed then",
+        "  installed:close()",
+        "",
+    ]
+    config = load_config()
+    record_key = (config.get("recordShortcut", "")
+                  if config.get("recordShortcutEnabled") is True else "")
+    if record_key:
+        lines.append('  o.bind("%s", "%s", "%s")'
+                     % (record_key, RECORD_BIND_LABEL,
+                        "omarchy-shell -q io.github.hpolthof.macros toggleRecording"))
+    if not macros and not record_key:
+        lines.append("  -- Nothing has a shortcut yet.")
+    for macro in macros:
+        label = macro.get("name", "Macro").replace("\\", "").replace('"', "'")
+        lines.append('  o.bind("%s", "Macro: %s", "%s play %s")'
+                     % (macro["shortcut"], label, SELF, macro["id"]))
+    lines.append("end")
+    lines.append("")
+
+    os.makedirs(HYPR_DIR, exist_ok=True)
+    body = "\n".join(lines)
+    try:
+        with open(BIND_FILE) as handle:
+            if handle.read() == body:
+                body = None
+    except OSError:
+        pass
+    if body is not None:
+        with open(BIND_FILE, "w") as handle:
+            handle.write(body)
+
+    ensure_required()
+    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
+
+
+# Recognising our own block by its exact wording meant that changing the
+# wording orphaned the old copy, and the next write put a second one beside
+# it. These match what the lines are about instead, so a block written by any
+# earlier version is still found and replaced.
+BLOCK_MARKERS = ("io.github.hpolthof.macros", "edit macros from the bar",
+                 "binds nothing once")
+
+
+def strip_require_block(content):
+    """Take out our require and the comment lines that introduce it."""
+    kept = []
+    for line in content.split("\n"):
+        bare = line.strip()
+        if bare in (BIND_REQUIRE, LEGACY_REQUIRE):
+            continue
+        if bare.startswith("--") and any(m in bare for m in BLOCK_MARKERS):
+            continue
+        kept.append(line)
+    # Removing lines from the middle of the file leaves the gap they sat in.
+    while len(kept) > 1 and kept[-1].strip() == "" and kept[-2].strip() == "":
+        kept.pop()
+    return "\n".join(kept)
+
+
+def ensure_required():
+    try:
+        with open(BINDINGS) as handle:
+            content = handle.read()
+    except OSError:
+        return
+    stripped = strip_require_block(content)
+    if not stripped.endswith("\n"):
+        stripped += "\n"
+    stripped += ("\n-- Keyboard macros (io.github.hpolthof.macros).\n"
+                 "-- The file it loads is generated and binds nothing once\n"
+                 "-- the plugin is gone; edit macros from the bar.\n"
+                 + BIND_REQUIRE + "\n")
+    if stripped != content:
+        with open(BINDINGS, "w") as handle:
+            handle.write(stripped)
+
+
+def cmd_sync_binds():
+    sync_binds()
+    emit({"synced": True})
+
+
+# ----------------------------------------------------------------- playback
+
+def ydotool(args):
+    env = dict(os.environ)
+    env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
+    return subprocess.run(["ydotool"] + args, env=env,
+                          capture_output=True, text=True, timeout=30)
+
+
+def cmd_play(argv):
+    if not argv:
+        die("usage: macros play <id>")
+    macro = load_macro(argv[0])
+    events = macro.get("events") or []
+    if not events:
+        die("that macro is empty")
+
+    if not os.path.exists(YDOTOOL_SOCKET):
+        die("ydotoold is not running (systemctl status omarchy-macros-ydotoold)")
+
+    # Recording never sees its own playback, but a recording that is running
+    # would see this one, and a macro that records itself grows without bound.
+    if recorder_pid():
+        die("not playing back while a recording is in progress")
+
+    time.sleep(LEAD_IN_MS / 1000.0)
+    ydotool(["key", "--key-delay", "0"] + ["%d:0" % code for code in MODIFIERS])
+
+    if macro.get("speed") == "real":
+        play_timed(events)
+    else:
+        play_fast(events)
+    emit({"played": macro["id"]})
+
+
+def play_fast(events):
+    """Replay as fast as is still reliable, in one call."""
+    codes = ["%d:%d" % (event["c"], event["v"]) for event in events]
+    for chunk in chunks(codes, 400):
+        result = ydotool(["key", "--key-delay", "12"] + chunk)
+        if result.returncode != 0:
+            die(result.stderr.strip() or "ydotool failed")
+
+
+def play_timed(events):
+    """Replay with the pauses that were recorded, minus the long ones.
+
+    Timing is against a schedule rather than a chain of sleeps. Each batch
+    costs a process launch, and sleeping the full gap on top of that puts
+    every later key a little further behind than the one before it, so a long
+    macro ends up noticeably slower than the one that was recorded.
+    """
+    start = time.monotonic()
+    schedule = 0.0
+    previous = events[0]["t"]
+    batch = []
+    for event in events:
+        gap = event["t"] - previous
+        previous = event["t"]
+        if gap > SIMULTANEOUS_MS:
+            flush(batch)
+            batch = []
+            schedule += min(gap, MAX_GAP_MS)
+            remaining = start + schedule / 1000.0 - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+        batch.append("%d:%d" % (event["c"], event["v"]))
+    flush(batch)
+
+
+def flush(batch):
+    if not batch:
+        return
+    result = ydotool(["key", "--key-delay", "0"] + batch)
+    if result.returncode != 0:
+        die(result.stderr.strip() or "ydotool failed")
+
+
+def chunks(items, size):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+# ----------------------------------------------------------------- removing
+
+def cmd_uninstall(argv):
+    """Undo everything outside the plugin directory.
+
+    Removing a plugin deletes its directory and nothing else, so the parts
+    that live elsewhere are cleaned up here. The bindings already disappear on
+    their own -- macros.lua checks for the plugin before registering anything
+    -- and this takes the file itself out too.
+    """
+    removed = []
+
+    unlink(BIND_FILE)
+    removed.append(BIND_FILE)
+
+    try:
+        with open(BINDINGS) as handle:
+            content = handle.read()
+    except OSError:
+        content = ""
+    trimmed = strip_require_block(content)
+    if trimmed != content:
+        with open(BINDINGS, "w") as handle:
+            handle.write(trimmed)
+        removed.append(BINDINGS + " (the require line)")
+
+    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
+
+    if "--all" in argv:
+        shutil.rmtree(DATA_DIR, ignore_errors=True)
+        removed.append(DATA_DIR)
+
+    sys.stdout.write("Removed:\n")
+    for item in removed:
+        sys.stdout.write("  " + item + "\n")
+    if "--all" not in argv:
+        sys.stdout.write("\nKept your macros in " + DATA_DIR
+                         + "\n  (pass --all to delete them too)\n")
+    sys.stdout.write("\nStill installed system-wide -- the recorder, its "
+                     "sudoers rule and\nthe ydotoold service. To take those "
+                     "out too:\n\n  " + SETUP + " --uninstall\n")
+
+
+# ------------------------------------------------------------------- doctor
+
+def cmd_doctor():
+    """What is missing from the stack, and the one command that fixes it.
+
+    Everything listed here is put in place by bin/macros-setup, so a fresh
+    install reports the same set and has the same answer.
+    """
+    problems = []
+    if not os.path.exists(RECORDER):
+        problems.append("the recorder is not installed at " + RECORDER)
+    else:
+        check = subprocess.run(["sudo", "-n", "-l", RECORDER],
+                               capture_output=True, text=True)
+        if check.returncode != 0:
+            problems.append("the sudoers rule for the recorder is missing")
+    try:
+        subprocess.run([sys.executable, "-c", "import evdev"], check=True,
+                       capture_output=True)
+    except (subprocess.CalledProcessError, OSError):
+        problems.append("python-evdev is not installed")
+    if not shutil.which("ydotool"):
+        problems.append("ydotool is not installed")
+    elif not os.path.exists(YDOTOOL_SOCKET):
+        problems.append("ydotoold is not running")
+    emit({
+        "ok": not problems,
+        "problems": problems,
+        # Shown in the panel and meant to be typed, so it is written the
+        # way a person would write it.
+        "fix": (SETUP.replace(os.path.expanduser("~"), "~", 1)
+                if problems else ""),
+    })
+
+
+# --------------------------------------------------------------------- main
+
+COMMANDS = {
+    "state": lambda argv: cmd_state(),
+    "record": lambda argv: cmd_record(),
+    "stop": lambda argv: cmd_stop(),
+    "cancel": lambda argv: cmd_cancel(),
+    "discard": lambda argv: cmd_discard(),
+    "save": cmd_save,
+    "list": lambda argv: cmd_list(),
+    "play": cmd_play,
+    "delete": cmd_delete,
+    "rename": cmd_rename,
+    "shortcut": cmd_shortcut,
+    "check-shortcut": cmd_check_shortcut,
+    "speed": cmd_speed,
+    "sync-binds": lambda argv: cmd_sync_binds(),
+    "config": lambda argv: cmd_config(),
+    "record-shortcut": cmd_record_shortcut,
+    "record-shortcut-enabled": cmd_record_shortcut_enabled,
+    "uninstall": cmd_uninstall,
+    "doctor": lambda argv: cmd_doctor(),
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__ + "\nCommands: "
+                         + ", ".join(sorted(COMMANDS)) + "\n")
+        return 0
+    action = sys.argv[1]
+    if action not in COMMANDS:
+        die("unknown command: " + action)
+    ensure_dirs()
+    COMMANDS[action](sys.argv[2:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+# Installed by bin/macros-setup, with @UID@ and @GID@ filled in.
+#
+# ydotool needs /dev/uinput, which is root-owned. The alternative to this unit
+# is adding the user to a group that can write it -- and then every process
+# they run can synthesise keystrokes. This runs as root instead and hands out
+# exactly one socket, owned by one user, mode 0600.
+
+[Unit]
+Description=ydotoold for the Omarchy macros plugin
+Documentation=man:ydotoold(8)
+
+[Service]
+Type=simple
+RuntimeDirectory=omarchy-macros
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/ydotoold --socket-path=/run/omarchy-macros/ydotoold.socket --socket-own=@UID@:@GID@ --socket-perm=0600
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
